@@ -2472,6 +2472,17 @@ pub(crate) fn wait_for_release(socket_path: &str) {
     }
 }
 
+/// Print where a policy layer came from and why it is locked, when the daemon
+/// reports it (builds with the `fixed-policy` feature).
+fn print_policy_source(status: &serde_json::Value, layer: &str) {
+    if let Some(source) = status[format!("{layer}_policy_source")].as_str() {
+        match status[format!("{layer}_policy_locked_reason")].as_str() {
+            Some(reason) => println!("  {layer} policy source: {source} ({reason})"),
+            None => println!("  {layer} policy source: {source}"),
+        }
+    }
+}
+
 /// `cua-driver status` implementation.
 pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
     if is_daemon_listening(socket_path) {
@@ -2520,6 +2531,7 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
                 if let Some(hash) = status["user_policy_sha256"].as_str() {
                     println!("  user policy sha256: {hash}");
                 }
+                print_policy_source(&status, "user");
                 println!(
                     "  managed policy: configured={}, active={}, valid={}",
                     status["managed_policy_configured"]
@@ -2531,6 +2543,7 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
                 if let Some(hash) = status["managed_policy_sha256"].as_str() {
                     println!("  managed policy sha256: {hash}");
                 }
+                print_policy_source(&status, "managed");
                 println!(
                     "  authorization host: {} ({})",
                     status["authorization_host"]

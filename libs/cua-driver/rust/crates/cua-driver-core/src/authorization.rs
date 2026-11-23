@@ -1439,11 +1439,11 @@ pub fn status_json_with_provider(authorization_host: Option<&'static str>) -> se
             "built_in_default"
         },
         "unrestricted_disabled_by_admin": env_flag(DISABLE_UNRESTRICTED_ENV),
-        "user_policy_configured": std::env::var_os(crate::policy::POLICY_FILE_ENV).is_some(),
+        "user_policy_configured": crate::policy::layer_configured(crate::policy::POLICY_FILE_ENV),
         "user_policy_active": matches!(policy, Ok(Some(_))),
         "user_policy_valid": policy.is_ok(),
         "user_policy_sha256": user_policy_sha256,
-        "managed_policy_configured": std::env::var_os(crate::policy::MANAGED_POLICY_FILE_ENV).is_some(),
+        "managed_policy_configured": crate::policy::layer_configured(crate::policy::MANAGED_POLICY_FILE_ENV),
         "managed_policy_active": matches!(managed_policy, Ok(Some(_))),
         "managed_policy_valid": managed_policy.is_ok(),
         "managed_policy_sha256": managed_policy_sha256,
@@ -1468,6 +1468,25 @@ pub fn status_json_with_provider(authorization_host: Option<&'static str>) -> se
         "session_policy_valid": capability_manifest.is_ok(),
         "session_policy": capability_manifest_status,
     });
+    if cfg!(feature = "fixed-policy") {
+        if let Some(target) = status.as_object_mut() {
+            for (layer, source) in [
+                ("user", crate::policy::user_policy_source()),
+                ("managed", crate::policy::managed_policy_source()),
+            ] {
+                target.insert(
+                    format!("{layer}_policy_source"),
+                    serde_json::json!(source.as_ref().map(crate::policy::PolicySource::as_str)),
+                );
+                target.insert(
+                    format!("{layer}_policy_locked_reason"),
+                    serde_json::json!(source
+                        .as_ref()
+                        .and_then(crate::policy::PolicySource::reason)),
+                );
+            }
+        }
+    }
     let session_status = crate::session_authorization::status_json();
     if let (Some(target), Some(session_status)) =
         (status.as_object_mut(), session_status.as_object())

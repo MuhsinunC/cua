@@ -16,6 +16,10 @@ rego = ["dep:regorus"]
 script = ["dep:rquickjs"]
 # OS credential-store history key provider (Linux Secret Service, Windows Credential Manager).
 keyring = ["dep:keyring"]
+# Operator-managed builds: ignore the policy environment variables and always
+# load ~/.config/cua-driver/policy/{policy.yaml,policy.rego}, serving a built-in
+# locked policy when either file is missing, a symbolic link or invalid.
+fixed-policy = ["yaml"]
 
 [dependencies]
 cua-driver-contract = { path = "../cua-driver-contract" }

@@ -142,10 +142,42 @@ fn canonical_tool_name(tool: &str) -> &str {
     }
 }
 
+#[cfg(feature = "fixed-policy")]
+mod fixed;
+
 #[derive(Debug, Clone)]
 struct ConfiguredPolicyLayer {
     engine: PolicyEngine,
     sha256: String,
+    source: PolicySource,
+}
+
+/// Where a configured policy layer came from, as `status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicySource {
+    /// The file named by the layer's environment variable.
+    Environment,
+    /// The layer's fixed file (builds with the `fixed-policy` feature).
+    FixedFile,
+    /// The built-in locked policy, served because the fixed file did not load.
+    BuiltInLocked { reason: String },
+}
+
+impl PolicySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::FixedFile => "fixed_file",
+            Self::BuiltInLocked { .. } => "built_in_locked",
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::BuiltInLocked { reason } => Some(reason.as_str()),
+            _ => None,
+        }
+    }
 }
 
 static CONFIGURED_POLICY: OnceLock<Result<Option<ConfiguredPolicyLayer>, String>> = OnceLock::new();
@@ -191,19 +223,37 @@ fn policy_sha256(path: &Path) -> Result<String> {
             .unwrap_or("policy");
         let bytes = std::fs::read(&file)
             .with_context(|| format!("failed to hash policy {}", file.display()))?;
-        digest.update((name.len() as u64).to_be_bytes());
-        digest.update(name.as_bytes());
-        digest.update((bytes.len() as u64).to_be_bytes());
-        digest.update(bytes);
+        hash_policy_file(&mut digest, name, &bytes);
     }
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn hash_policy_file(digest: &mut Sha256, name: &str, bytes: &[u8]) {
+    digest.update((name.len() as u64).to_be_bytes());
+    digest.update(name.as_bytes());
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
+#[cfg(not(feature = "fixed-policy"))]
 fn load_configured_layer(env_name: &str) -> Result<Option<ConfiguredPolicyLayer>, String> {
     let Some(path_os) = std::env::var_os(env_name) else {
         return Ok(None);
     };
-    let path = Path::new(&path_os);
+    load_policy_path(Path::new(&path_os), PolicySource::Environment)
+}
+
+/// A `fixed-policy` build ignores the policy environment variables: each layer
+/// is its fixed file, or the built-in locked policy when that file does not load.
+#[cfg(feature = "fixed-policy")]
+fn load_configured_layer(env_name: &str) -> Result<Option<ConfiguredPolicyLayer>, String> {
+    Ok(Some(fixed::load_layer(env_name)))
+}
+
+fn load_policy_path(
+    path: &Path,
+    source: PolicySource,
+) -> Result<Option<ConfiguredPolicyLayer>, String> {
     if !path.exists() {
         return Err(format!(
             "configured permission policy path does not exist: {}",
@@ -222,7 +272,11 @@ fn load_configured_layer(env_name: &str) -> Result<Option<ConfiguredPolicyLayer>
             path.display()
         ));
     }
-    Ok(Some(ConfiguredPolicyLayer { engine, sha256 }))
+    Ok(Some(ConfiguredPolicyLayer {
+        engine,
+        sha256,
+        source,
+    }))
 }
 
 /// Return the process-wide policy configured through [`POLICY_FILE_ENV`].
@@ -260,6 +314,30 @@ pub fn user_policy_sha256() -> Result<Option<String>, String> {
 
 pub fn managed_policy_sha256() -> Result<Option<String>, String> {
     layer_sha256(&CONFIGURED_MANAGED_POLICY, MANAGED_POLICY_FILE_ENV)
+}
+
+fn layer_source(
+    layer: &'static OnceLock<Result<Option<ConfiguredPolicyLayer>, String>>,
+    env_name: &str,
+) -> Option<PolicySource> {
+    match layer.get_or_init(|| load_configured_layer(env_name)) {
+        Ok(policy) => policy.as_ref().map(|configured| configured.source.clone()),
+        Err(_) => None,
+    }
+}
+
+pub fn user_policy_source() -> Option<PolicySource> {
+    layer_source(&CONFIGURED_POLICY, POLICY_FILE_ENV)
+}
+
+pub fn managed_policy_source() -> Option<PolicySource> {
+    layer_source(&CONFIGURED_MANAGED_POLICY, MANAGED_POLICY_FILE_ENV)
+}
+
+/// Whether a policy layer is configured for this process: always in a
+/// `fixed-policy` build, otherwise when its environment variable is set.
+pub fn layer_configured(env_name: &str) -> bool {
+    cfg!(feature = "fixed-policy") || std::env::var_os(env_name).is_some()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
