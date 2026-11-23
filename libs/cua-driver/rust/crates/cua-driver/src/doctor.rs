@@ -656,6 +656,8 @@ fn append_install_hygiene_probes(report: &mut Report, fix: bool) {
 
     let active = PathBuf::from(crate::bundle::app_bundle_path());
     let bundle_id = crate::bundle::bundle_id();
+    // The identity macOS keys privacy permissions and app copies by.
+    report.push(Probe::ok("bundle id", bundle_id));
     let (registered, indexed_only): (Vec<_>, Vec<_>) =
         copies::discover(&active, bundle_id, &copies::run_program)
             .into_iter()
@@ -686,10 +688,13 @@ fn append_install_hygiene_probes(report: &mut Report, fix: bool) {
         .join(crate::bundle::cli_name());
     let rows = home_dir()
         .ok_or_else(|| "HOME is not set".to_owned())
-        .and_then(|home| copies::read_tcc_rows(&home, &copies::run_program));
-    report.push(copies::permission_row_probe(&executable, rows, |bundle| {
-        copies::bundle_version_of(bundle, &copies::run_program)
-    }));
+        .and_then(|home| copies::read_tcc_rows(&home, bundle_id, &copies::run_program));
+    report.push(copies::permission_row_probe(
+        &executable,
+        bundle_id,
+        rows,
+        |bundle| copies::bundle_version_of(bundle, &copies::run_program),
+    ));
 }
 
 /// The cross-platform probes over explicit host inputs, then `platform`'s.

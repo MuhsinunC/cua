@@ -348,16 +348,19 @@ pub struct TccRow {
     pub client_type: i64,
 }
 
-/// Cua Driver rows in the current user's permission database. `Err` carries the
-/// plain reason, normally that macOS only lets apps with Full Disk Access read it.
-pub fn read_tcc_rows(home: &Path, run: Run) -> Result<Vec<TccRow>, String> {
+/// Cua Driver rows (`bundle_id`'s, or any path naming the driver) in the current
+/// user's permission database. `Err` carries the plain reason, normally that
+/// macOS only lets apps with Full Disk Access read it.
+pub fn read_tcc_rows(home: &Path, bundle_id: &str, run: Run) -> Result<Vec<TccRow>, String> {
     let db = home.join("Library/Application Support/com.apple.TCC/TCC.db");
     let db_text = db.to_string_lossy().into_owned();
-    let sql = "SELECT service, client, client_type FROM access \
-               WHERE client = 'com.trycua.driver' OR client LIKE '%cua-driver%' \
-               OR client LIKE '%CuaDriver%';";
+    let sql = format!(
+        "SELECT service, client, client_type FROM access \
+         WHERE client = '{bundle_id}' OR client LIKE '%cua-driver%' \
+         OR client LIKE '%CuaDriver%';"
+    );
     let out =
-        run(SQLITE3, &["-separator", "|", &db_text, sql], QUICK_TIMEOUT).ok_or_else(|| {
+        run(SQLITE3, &["-separator", "|", &db_text, &sql], QUICK_TIMEOUT).ok_or_else(|| {
             "macOS only lets apps with Full Disk Access read the permission database".to_owned()
         })?;
     Ok(parse_tcc_rows(&out))
@@ -388,11 +391,15 @@ fn service_name(service: &str) -> &str {
     }
 }
 
-const REMOVE_ROWS_HELP: &str = "To remove one stale row: System Settings > Privacy & Security > \
-Accessibility (and Screen & System Audio Recording), select the extra Cua Driver entry and click \
-the minus button.\nTo clear every Cua Driver row and start over: `tccutil reset Accessibility \
-com.trycua.driver`, `tccutil reset ScreenCapture com.trycua.driver`, then \
-`cua-driver permissions grant`.";
+fn remove_rows_help(bundle_id: &str) -> String {
+    format!(
+        "To remove one stale row: System Settings > Privacy & Security > Accessibility (and \
+         Screen & System Audio Recording), select the extra Cua Driver entry and click the minus \
+         button.\nTo clear every Cua Driver row and start over: `tccutil reset Accessibility \
+         {bundle_id}`, `tccutil reset ScreenCapture {bundle_id}`, then \
+         `cua-driver permissions grant`."
+    )
+}
 
 /// The doctor probe for permission rows tied to a different path or version.
 ///
@@ -401,6 +408,7 @@ com.trycua.driver`, `tccutil reset ScreenCapture com.trycua.driver`, then \
 /// installed executable is stale.
 pub fn permission_row_probe(
     active_executable: &Path,
+    bundle_id: &str,
     rows: Result<Vec<TccRow>, String>,
     version_of: impl Fn(&Path) -> Option<String>,
 ) -> Probe {
@@ -450,7 +458,11 @@ pub fn permission_row_probe(
             active_executable.display()
         ),
     )
-    .with_detail(format!("{}\n{REMOVE_ROWS_HELP}", lines.join("\n")))
+    .with_detail(format!(
+        "{}\n{}",
+        lines.join("\n"),
+        remove_rows_help(bundle_id)
+    ))
 }
 
 // ── Process runner ────────────────────────────────────────────────────────
@@ -789,7 +801,7 @@ identifier:                 com.trycua.driver
              kTCCServiceScreenCapture|/Users/me/Downloads/CuaDriver.app/Contents/MacOS/cua-driver|1\n",
         ));
 
-        let probe = permission_row_probe(active, rows, |bundle| {
+        let probe = permission_row_probe(active, "com.trycua.driver", rows, |bundle| {
             bundle
                 .ends_with("Downloads/CuaDriver.app")
                 .then(|| "0.34.0".to_owned())
@@ -816,7 +828,7 @@ identifier:                 com.trycua.driver
              kTCCServiceAccessibility|/Applications/CuaDriver.app/Contents/MacOS/cua-driver|1\n",
         ));
 
-        let probe = permission_row_probe(active, rows, |_| None);
+        let probe = permission_row_probe(active, "com.trycua.driver", rows, |_| None);
 
         assert_eq!(probe.status, Status::Ok);
     }
@@ -825,6 +837,7 @@ identifier:                 com.trycua.driver
     fn an_unreadable_permission_database_is_reported_as_not_checked() {
         let probe = permission_row_probe(
             Path::new("/Applications/CuaDriver.app/Contents/MacOS/cua-driver"),
+            "com.trycua.driver",
             Err("macOS only lets apps with Full Disk Access read the permission database".into()),
             |_| None,
         );

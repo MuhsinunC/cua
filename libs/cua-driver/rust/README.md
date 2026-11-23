@@ -157,3 +157,38 @@ source `fixed_file`. The status JSON carries them as `*_policy_valid`,
 default builds the source is `environment` for a layer loaded from its
 variable and `null` otherwise. The fixed folder is supported on Unix;
 elsewhere both layers are always locked.
+
+A fixed-policy build never updates itself: its operator builds and installs
+it, and a release installed over it would not enforce their policy. `update`
+(with or without `--apply`), `check-update`, the `check_for_update` tool and the
+release channel commands refuse with "This build is managed by its operator;
+updates come from them", and the startup update notice is never shown.
+
+`doctor` reports the app's bundle id (`bundle id`), which the driver reads
+from the Info.plist of the app it runs in, so a fixed-policy app given its own
+bundle id names that id in `permissions grant`, in doctor's checks and in the
+Computer History identity check.
+
+#### Root-owned policy files
+
+By default the account that runs the driver owns its policy folder, so any
+program running as that account can rewrite the files. To take that away,
+build with `--features cua-driver/fixed-policy-root-owned` (it includes
+`fixed-policy`). Checked on the folders and files the driver opened:
+
+- `~/.config/cua-driver`, `~/.config/cua-driver/policy` and both files are
+  owned by root;
+- no folder in the chain is writable by group or others, and the files are
+  writable by no one;
+- `~/.config` may also be owned by the account, but is not writable by group
+  or others.
+
+Anything else serves the built-in locked policy, with a reason that names the
+path, its owner and its mode. After writing the files, one administrator step
+puts the folder in that state (`wheel` is `root` on Linux):
+
+```sh
+sudo sh -c 'd="$1/.config/cua-driver"; chown -R root:wheel "$d" && chmod 755 "$d" "$d/policy" && chmod 444 "$d/policy/policy.yaml" "$d/policy/policy.rego" && chmod go-w "$1/.config"' sh "$HOME"
+```
+
+To change the policy later, the administrator replaces the files the same way.

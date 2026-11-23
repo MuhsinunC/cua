@@ -37,11 +37,22 @@ pub(crate) enum UpdateOwner {
     /// installer would add a second driver beside it.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     HostApp(String),
+    /// A `fixed-policy` build. Its operator builds and installs it; a release
+    /// installed over it would no longer enforce the operator's policy.
+    #[cfg_attr(not(feature = "fixed-policy"), allow(dead_code))]
+    FixedPolicyOperator,
 }
 
 impl UpdateOwner {
     pub(crate) fn guidance(&self) -> String {
         match self {
+            Self::FixedPolicyOperator => {
+                "This build is managed by its operator; updates come from them. \
+                 It is a fixed-policy build, so the upstream installer and stable/nightly \
+                 channel switching are disabled: a release installed over it would not \
+                 enforce the operator's policy."
+                    .to_owned()
+            }
             Self::Pacman => {
                 "This executable is managed by pacman. Update with `sudo pacman -Syu`; \
                  release selection and availability are controlled by your package repository. \
@@ -61,6 +72,9 @@ impl UpdateOwner {
 /// Only positive ownership disables the upstream updater. Missing pacman,
 /// failed queries, and unresolved paths retain unmanaged behavior.
 pub(crate) fn update_owner() -> Option<UpdateOwner> {
+    if cfg!(feature = "fixed-policy") {
+        return Some(UpdateOwner::FixedPolicyOperator);
+    }
     #[cfg(target_os = "macos")]
     {
         let executable = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
@@ -244,6 +258,10 @@ mod tests {
             (
                 UpdateOwner::HostApp("Other".to_owned()),
                 "part of Other and updates with it",
+            ),
+            (
+                UpdateOwner::FixedPolicyOperator,
+                "managed by its operator; updates come from them",
             ),
         ] {
             let error = run_install_script_with_owner("0.24.0", Some(owner)).unwrap_err();

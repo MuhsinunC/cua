@@ -89,13 +89,52 @@ pub fn app_bundle_path() -> String {
     format!("/Applications/{}.app", app_name())
 }
 
+/// The running app's bundle identifier: the `CFBundleIdentifier` in the
+/// Info.plist of the `.app` whose `Contents/MacOS` holds this executable, so a
+/// build given its own identifier names itself. Outside such an app, the
+/// release or local product's identifier.
 #[cfg(target_os = "macos")]
 pub fn bundle_id() -> &'static str {
-    if is_local_installation() {
-        LOCAL_BUNDLE_ID
-    } else {
-        RELEASE_BUNDLE_ID
-    }
+    static BUNDLE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BUNDLE_ID.get_or_init(|| {
+        running_app_bundle_id().unwrap_or_else(|| {
+            if is_local_installation() {
+                LOCAL_BUNDLE_ID
+            } else {
+                RELEASE_BUNDLE_ID
+            }
+            .to_owned()
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn running_app_bundle_id() -> Option<String> {
+    let executable = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
+    let app = app_of_executable(&executable)?;
+    platform_macos::tools::bundle_identifier_at(app).filter(|id| is_bundle_identifier(id))
+}
+
+/// `<name>.app` for an executable at `<name>.app/Contents/MacOS/<file>`.
+#[cfg(target_os = "macos")]
+fn app_of_executable(executable: &Path) -> Option<&Path> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    let app = contents.parent()?;
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && app.extension()? == "app")
+        .then_some(app)
+}
+
+/// Letters, digits, `-` and `.` only: the identifier goes into Spotlight and
+/// permission-database queries.
+#[cfg(target_os = "macos")]
+fn is_bundle_identifier(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
 }
 
 /// A bundled daemon already has its stable TCC responsibility identity and

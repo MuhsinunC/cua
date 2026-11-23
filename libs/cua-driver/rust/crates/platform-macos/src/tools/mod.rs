@@ -267,6 +267,7 @@ pub use check_permissions::{
 };
 
 pub use cua_driver_core::snapshot_store::ZoomContext;
+pub use health_report::bundle_identifier_at;
 pub(crate) use health_report::current_bundle_identifier as main_bundle_identifier;
 pub(crate) use health_report::sw_vers_product_version as macos_product_version;
 

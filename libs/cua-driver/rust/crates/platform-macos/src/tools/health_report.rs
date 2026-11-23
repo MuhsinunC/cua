@@ -331,6 +331,11 @@ fn application_bundle_identifier_for_pid(pid: u32) -> Option<String> {
     let bundle_path = path
         .ancestors()
         .find(|candidate| candidate.extension().is_some_and(|ext| ext == "app"))?;
+    bundle_identifier_at(bundle_path)
+}
+
+/// The `CFBundleIdentifier` in the Info.plist of the bundle at `bundle_path`.
+pub fn bundle_identifier_at(bundle_path: &std::path::Path) -> Option<String> {
     let bundle_url = core_foundation::url::CFURL::from_path(bundle_path, true)?;
     let bundle = core_foundation::bundle::CFBundle::new(bundle_url)?;
     bundle_identifier(&bundle)
