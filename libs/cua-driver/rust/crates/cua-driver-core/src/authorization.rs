@@ -1399,8 +1399,8 @@ pub fn status_json_with_provider(authorization_host: Option<&'static str>) -> se
     let managed_policy = crate::policy::configured_managed_policy();
     let user_policy_sha256 = crate::policy::user_policy_sha256().ok().flatten();
     let managed_policy_sha256 = crate::policy::managed_policy_sha256().ok().flatten();
-    let user_policy_source = crate::policy::user_policy_source();
-    let managed_policy_source = crate::policy::managed_policy_source();
+    let user_policy_status = crate::policy::user_policy_status();
+    let managed_policy_status = crate::policy::managed_policy_status();
     let effective_active_risk_enforcement = mode
         .as_ref()
         .map(|mode| adapter_ids_with_state_for_mode(*mode, RiskEnforcement::Active))
@@ -1441,37 +1441,23 @@ pub fn status_json_with_provider(authorization_host: Option<&'static str>) -> se
             "built_in_default"
         },
         "unrestricted_disabled_by_admin": env_flag(DISABLE_UNRESTRICTED_ENV),
-        "user_policy_configured": crate::policy::layer_configured(
-            crate::policy::POLICY_FILE_ENV,
-            user_policy_source.as_ref(),
-        ),
+        "user_policy_configured": user_policy_status.configured,
         "user_policy_active": matches!(policy, Ok(Some(_))),
-        // A layer served by the built-in locked policy (`fixed-policy` builds)
-        // is active, but its own policy is not valid.
-        "user_policy_valid": policy.is_ok()
-            && !user_policy_source
-                .as_ref()
-                .is_some_and(crate::policy::PolicySource::is_locked_fallback),
+        "user_policy_valid": user_policy_status.valid,
         "user_policy_sha256": user_policy_sha256,
-        "user_policy_source": user_policy_source.as_ref().map(crate::policy::PolicySource::as_str),
-        "user_policy_locked_reason": user_policy_source
-            .as_ref()
+        "user_policy_source": user_policy_status.source.map(crate::policy::PolicySource::as_str),
+        "user_policy_locked_reason": user_policy_status
+            .source
             .and_then(crate::policy::PolicySource::reason),
-        "managed_policy_configured": crate::policy::layer_configured(
-            crate::policy::MANAGED_POLICY_FILE_ENV,
-            managed_policy_source.as_ref(),
-        ),
+        "managed_policy_configured": managed_policy_status.configured,
         "managed_policy_active": matches!(managed_policy, Ok(Some(_))),
-        "managed_policy_valid": managed_policy.is_ok()
-            && !managed_policy_source
-                .as_ref()
-                .is_some_and(crate::policy::PolicySource::is_locked_fallback),
+        "managed_policy_valid": managed_policy_status.valid,
         "managed_policy_sha256": managed_policy_sha256,
-        "managed_policy_source": managed_policy_source
-            .as_ref()
+        "managed_policy_source": managed_policy_status
+            .source
             .map(crate::policy::PolicySource::as_str),
-        "managed_policy_locked_reason": managed_policy_source
-            .as_ref()
+        "managed_policy_locked_reason": managed_policy_status
+            .source
             .and_then(crate::policy::PolicySource::reason),
         "built_in_ceiling": "reviewed_tool_and_risk_map_v1",
         "risk_metadata_version": RISK_METADATA_VERSION,
@@ -1614,6 +1600,8 @@ mod tests {
         assert_eq!(isolated.enforcement, RiskEnforcement::Active);
     }
 
+    // A fixed-policy build without its policy files denies by policy first.
+    #[cfg(not(feature = "fixed-policy"))]
     #[test]
     fn unknown_tools_are_unclassified_and_denied() {
         let error = authorize_tool_call("new_unreviewed_tool", &serde_json::json!({}))
@@ -1958,7 +1946,8 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "yaml")]
+    // A fixed-policy build without its policy files denies by policy first.
+    #[cfg(all(feature = "yaml", not(feature = "fixed-policy")))]
     #[test]
     fn standard_manifest_scope_is_checked_before_existing_profile_approval() {
         use std::io::Write as _;

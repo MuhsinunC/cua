@@ -20,6 +20,9 @@ keyring = ["dep:keyring"]
 # load ~/.config/cua-driver/policy/{policy.yaml,policy.rego}, serving a built-in
 # locked policy when either file is missing, a symbolic link or invalid.
 fixed-policy = ["yaml", "rego"]
+# Also require the fixed folders and files to be owned by root and not
+# writable by the account (opt-in; see the README).
+fixed-policy-root-owned = ["fixed-policy"]
 
 [dependencies]
 cua-driver-contract = { path = "../cua-driver-contract" }

@@ -90,6 +90,9 @@ review-trust-root = []
 # Operator-managed builds that always load the fixed policy folder and start
 # locked without it (see cua-driver-core's `fixed-policy`). Off by default.
 fixed-policy = ["cua-driver-core/fixed-policy"]
+# A fixed-policy build that also requires its policy folder and files to be
+# owned by root (see cua-driver-core's `fixed-policy-root-owned`).
+fixed-policy-root-owned = ["fixed-policy", "cua-driver-core/fixed-policy-root-owned"]
 # GNOME/KDE portal input ships in ordinary Linux releases; PipeWire capture
 # remains a separate modern-desktop feature. The combined name stays as a
 # compatibility alias for Nix and downstream builds.

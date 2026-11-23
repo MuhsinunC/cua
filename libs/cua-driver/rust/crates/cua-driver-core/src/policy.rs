@@ -150,6 +150,9 @@ struct ConfiguredPolicyLayer {
     engine: PolicyEngine,
     sha256: String,
     source: PolicySource,
+    /// Whether a policy was configured for the layer: its environment
+    /// variable is set, or (`fixed-policy` builds) its fixed file is present.
+    configured: bool,
 }
 
 /// Where a configured policy layer came from, as `status` reports it.
@@ -160,8 +163,7 @@ pub enum PolicySource {
     /// The layer's fixed file (builds with the `fixed-policy` feature).
     FixedFile,
     /// The built-in locked policy, served because the fixed file did not load.
-    /// `file_present` says whether anything was found at the fixed path.
-    BuiltInLocked { reason: String, file_present: bool },
+    BuiltInLocked { reason: String },
 }
 
 impl PolicySource {
@@ -175,21 +177,29 @@ impl PolicySource {
 
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Self::BuiltInLocked { reason, .. } => Some(reason.as_str()),
+            Self::BuiltInLocked { reason } => Some(reason.as_str()),
             _ => None,
         }
     }
-
-    /// Whether the layer's own policy did not load and the built-in locked
-    /// policy is enforced in its place.
-    pub fn is_locked_fallback(&self) -> bool {
-        matches!(self, Self::BuiltInLocked { .. })
-    }
 }
 
-static CONFIGURED_POLICY: OnceLock<Result<Option<ConfiguredPolicyLayer>, String>> = OnceLock::new();
-static CONFIGURED_MANAGED_POLICY: OnceLock<Result<Option<ConfiguredPolicyLayer>, String>> =
-    OnceLock::new();
+/// What `status` reports about one policy layer.
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyLayerStatus {
+    /// A policy is configured for the layer: its environment variable is set
+    /// or, in a `fixed-policy` build, its fixed file is present.
+    pub configured: bool,
+    /// The layer's own policy loaded. False when it failed to load, and when
+    /// the built-in locked policy is enforced in its place.
+    pub valid: bool,
+    /// Where the enforced policy came from; `None` when no policy is enforced.
+    pub source: Option<&'static PolicySource>,
+}
+
+type PolicyLayer = Result<Option<ConfiguredPolicyLayer>, String>;
+
+static CONFIGURED_POLICY: OnceLock<PolicyLayer> = OnceLock::new();
+static CONFIGURED_MANAGED_POLICY: OnceLock<PolicyLayer> = OnceLock::new();
 
 // A `fixed-policy` build reads its files through `fixed`, not by path.
 #[cfg_attr(feature = "fixed-policy", allow(dead_code))]
@@ -258,12 +268,12 @@ fn policy_digest<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> St
 /// A `fixed-policy` build ignores the policy environment variables: each layer
 /// is its fixed file, or the built-in locked policy when that file does not load.
 #[cfg(feature = "fixed-policy")]
-fn load_configured_layer(env_name: &str) -> Result<Option<ConfiguredPolicyLayer>, String> {
+fn load_configured_layer(env_name: &str) -> PolicyLayer {
     Ok(Some(fixed::load_layer(env_name)))
 }
 
 #[cfg(not(feature = "fixed-policy"))]
-fn load_configured_layer(env_name: &str) -> Result<Option<ConfiguredPolicyLayer>, String> {
+fn load_configured_layer(env_name: &str) -> PolicyLayer {
     let Some(path_os) = std::env::var_os(env_name) else {
         return Ok(None);
     };
@@ -290,74 +300,85 @@ fn load_configured_layer(env_name: &str) -> Result<Option<ConfiguredPolicyLayer>
         engine,
         sha256,
         source: PolicySource::Environment,
+        configured: true,
     }))
 }
 
-/// Return the process-wide policy configured through [`POLICY_FILE_ENV`].
-/// The file is loaded once so stdio and HTTP requests use the same immutable
-/// policy snapshot for the lifetime of the driver process.
-pub fn configured_policy() -> Result<Option<&'static PolicyEngine>, String> {
-    match CONFIGURED_POLICY.get_or_init(|| load_configured_layer(POLICY_FILE_ENV)) {
-        Ok(policy) => Ok(policy.as_ref().map(|layer| &layer.engine)),
-        Err(error) => Err(error.clone()),
+/// The process-wide layer configured through `env_name`, loaded once so stdio
+/// and HTTP requests use the same immutable policy snapshot for the lifetime
+/// of the driver process.
+fn layer(slot: &'static OnceLock<PolicyLayer>, env_name: &str) -> &'static PolicyLayer {
+    slot.get_or_init(|| load_configured_layer(env_name))
+}
+
+fn user_layer() -> &'static PolicyLayer {
+    layer(&CONFIGURED_POLICY, POLICY_FILE_ENV)
+}
+
+fn managed_layer() -> &'static PolicyLayer {
+    layer(&CONFIGURED_MANAGED_POLICY, MANAGED_POLICY_FILE_ENV)
+}
+
+fn engine(layer: &'static PolicyLayer) -> Result<Option<&'static PolicyEngine>, String> {
+    layer
+        .as_ref()
+        .map(|policy| policy.as_ref().map(|configured| &configured.engine))
+        .map_err(Clone::clone)
+}
+
+fn sha256(layer: &PolicyLayer) -> Result<Option<String>, String> {
+    layer
+        .as_ref()
+        .map(|policy| policy.as_ref().map(|configured| configured.sha256.clone()))
+        .map_err(Clone::clone)
+}
+
+fn status(layer: &'static PolicyLayer) -> PolicyLayerStatus {
+    match layer {
+        Ok(Some(configured)) => PolicyLayerStatus {
+            configured: configured.configured,
+            valid: !matches!(configured.source, PolicySource::BuiltInLocked { .. }),
+            source: Some(&configured.source),
+        },
+        Ok(None) => PolicyLayerStatus {
+            configured: false,
+            valid: true,
+            source: None,
+        },
+        // Only a configured layer can fail to load.
+        Err(_) => PolicyLayerStatus {
+            configured: true,
+            valid: false,
+            source: None,
+        },
     }
+}
+
+/// Return the process-wide policy configured through [`POLICY_FILE_ENV`].
+pub fn configured_policy() -> Result<Option<&'static PolicyEngine>, String> {
+    engine(user_layer())
 }
 
 /// Return the immutable administrator-owned ceiling. A user policy is always
 /// intersected with this layer and can never widen it.
 pub fn configured_managed_policy() -> Result<Option<&'static PolicyEngine>, String> {
-    match CONFIGURED_MANAGED_POLICY.get_or_init(|| load_configured_layer(MANAGED_POLICY_FILE_ENV)) {
-        Ok(policy) => Ok(policy.as_ref().map(|layer| &layer.engine)),
-        Err(error) => Err(error.clone()),
-    }
-}
-
-fn layer_sha256(
-    layer: &'static OnceLock<Result<Option<ConfiguredPolicyLayer>, String>>,
-    env_name: &str,
-) -> Result<Option<String>, String> {
-    match layer.get_or_init(|| load_configured_layer(env_name)) {
-        Ok(policy) => Ok(policy.as_ref().map(|configured| configured.sha256.clone())),
-        Err(error) => Err(error.clone()),
-    }
+    engine(managed_layer())
 }
 
 pub fn user_policy_sha256() -> Result<Option<String>, String> {
-    layer_sha256(&CONFIGURED_POLICY, POLICY_FILE_ENV)
+    sha256(user_layer())
 }
 
 pub fn managed_policy_sha256() -> Result<Option<String>, String> {
-    layer_sha256(&CONFIGURED_MANAGED_POLICY, MANAGED_POLICY_FILE_ENV)
+    sha256(managed_layer())
 }
 
-fn layer_source(
-    layer: &'static OnceLock<Result<Option<ConfiguredPolicyLayer>, String>>,
-    env_name: &str,
-) -> Option<PolicySource> {
-    match layer.get_or_init(|| load_configured_layer(env_name)) {
-        Ok(policy) => policy.as_ref().map(|configured| configured.source.clone()),
-        Err(_) => None,
-    }
+pub fn user_policy_status() -> PolicyLayerStatus {
+    status(user_layer())
 }
 
-pub fn user_policy_source() -> Option<PolicySource> {
-    layer_source(&CONFIGURED_POLICY, POLICY_FILE_ENV)
-}
-
-pub fn managed_policy_source() -> Option<PolicySource> {
-    layer_source(&CONFIGURED_MANAGED_POLICY, MANAGED_POLICY_FILE_ENV)
-}
-
-/// Whether a policy layer is configured for this process: in a `fixed-policy`
-/// build, whether its fixed file is present; otherwise whether its environment
-/// variable is set. `source` is the layer's [`user_policy_source`] or
-/// [`managed_policy_source`].
-pub fn layer_configured(env_name: &str, source: Option<&PolicySource>) -> bool {
-    match source {
-        Some(PolicySource::FixedFile) => true,
-        Some(PolicySource::BuiltInLocked { file_present, .. }) => *file_present,
-        Some(PolicySource::Environment) | None => std::env::var_os(env_name).is_some(),
-    }
+pub fn managed_policy_status() -> PolicyLayerStatus {
+    status(managed_layer())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
