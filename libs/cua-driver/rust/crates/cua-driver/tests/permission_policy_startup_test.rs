@@ -108,6 +108,8 @@ fn direct_mcp_still_reads_permission_profile_from_environment() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires --capability-manifest"));
 }
 
+// A fixed-policy build ignores the policy environment variables.
+#[cfg(not(feature = "fixed-policy"))]
 #[test]
 fn missing_configured_policy_prevents_daemon_startup() {
     let directory = tempfile::tempdir().expect("temporary policy test directory");
@@ -145,6 +147,8 @@ fn missing_configured_policy_prevents_daemon_startup() {
     );
 }
 
+// A fixed-policy build ignores the policy environment variables.
+#[cfg(not(feature = "fixed-policy"))]
 #[test]
 fn missing_managed_policy_prevents_daemon_startup() {
     let directory = tempfile::tempdir().expect("temporary managed policy test directory");

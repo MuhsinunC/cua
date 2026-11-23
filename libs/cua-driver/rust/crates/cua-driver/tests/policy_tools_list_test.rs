@@ -3,7 +3,11 @@
 
 //! Permission policy must shape the MCP tool roster as well as invocation.
 
-#![cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+// A fixed-policy build ignores CUA_DRIVER_POLICY_FILE, which this test sets.
+#![cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    not(feature = "fixed-policy")
+))]
 
 use std::collections::HashSet;
 

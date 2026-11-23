@@ -2,6 +2,10 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 //! Public tool transports must fail closed when no daemon is reachable.
+//!
+//! The daemons these tests start serve with no permission policy, which a
+//! fixed-policy build never does.
+#![cfg(not(feature = "fixed-policy"))]
 
 use std::io::Write as _;
 use std::process::Command;

@@ -1092,6 +1092,8 @@ mod tests {
         }
     }
 
+    // A fixed-policy build ignores the policy environment variables.
+    #[cfg(not(feature = "fixed-policy"))]
     #[tokio::test]
     async fn proxy_authorization_refusal_is_a_tool_error_without_forwarding() {
         const CHILD_ENV: &str = "CUA_DRIVER_PROXY_REFUSAL_TEST_CHILD";
