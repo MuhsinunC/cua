@@ -1,13 +1,16 @@
 name: "Build: Cua Driver (fixed policy)"
 
-# Builds the universal CuaDriver.app with the `fixed-policy` feature, the way
+# Builds the universal CuaDriver.app with the `fixed-policy` feature (or, when
+# dispatched with `root_owned: true`, `fixed-policy-root-owned`), the way
 # cd-rust-cua-driver.yml builds the release app, without Developer ID signing
 # or notarization: the app is signed ad hoc and carries its own bundle id, so
 # macOS privacy grants never confuse it with the release app. The end-to-end
 # tests in libs/cua-driver/scripts/tests/test_fixed_policy_macos.py run
-# against the built app on the runner. The `release` job publishes the tested
-# archive (SHA256SUMS, Sigstore bundles and a build-provenance attestation)
-# only when dispatched with `release: true`.
+# against the built app on the runner, then against an arm64 build of the
+# other variant. Formatting, lints and the policy tests run in a parallel
+# Linux job. The `release` job publishes the tested archive (SHA256SUMS,
+# Sigstore bundles and a build-provenance attestation) only when dispatched
+# with `release: true`.
 
 on:
   workflow_dispatch:
@@ -16,19 +19,23 @@ on:
         description: "Publish the tested build as a release of this repository"
         type: boolean
         default: false
+      root_owned:
+        description: "Build fixed-policy-root-owned: the policy folder and files must be owned by root"
+        type: boolean
+        default: false
       bundle_id:
         description: "CFBundleIdentifier of the built app (default com.trycua.driver.fixedpolicy)"
         type: string
         default: ""
       release_tag:
-        description: "Release tag (default cua-driver-rs-v<cua-driver version>-fixedpolicy.1)"
+        description: "Release tag (default cua-driver-rs-v<cua-driver version>-<variant>.1)"
         type: string
         default: ""
   # A workflow_dispatch workflow must exist on the default branch before it can
-  # be dispatched; until then, and on every other branch, a push that touches
-  # the driver or this workflow runs the build and tests.
+  # be dispatched; until then, a push to a feature branch that touches the
+  # driver or this workflow runs the build and tests.
   push:
-    branches-ignore: [main]
+    branches: ["feat/**"]
     paths:
       - "libs/cua-driver/**"
       - ".github/workflows/build-fixed-policy-driver.yml"
@@ -38,15 +45,72 @@ permissions:
 
 concurrency:
   group: build-fixed-policy-driver-${{ github.ref }}
-  cancel-in-progress: false
+  # A newer push supersedes a running build; a dispatched build always finishes.
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   # Cua programs run here never send usage telemetry.
   CUA_TELEMETRY: "0"
   DO_NOT_TRACK: "1"
   BUNDLE_ID: ${{ inputs.bundle_id || 'com.trycua.driver.fixedpolicy' }}
+  # The variant the app is built as, and the other one, tested on arm64 only.
+  FEATURE: ${{ inputs.root_owned && 'fixed-policy-root-owned' || 'fixed-policy' }}
+  OTHER_FEATURE: ${{ inputs.root_owned && 'fixed-policy' || 'fixed-policy-root-owned' }}
+  ROOT_OWNED: ${{ inputs.root_owned && '1' || '0' }}
+  OTHER_ROOT_OWNED: ${{ inputs.root_owned && '0' || '1' }}
+  VARIANT: ${{ inputs.root_owned && 'fixedpolicy-rootowned' || 'fixedpolicy' }}
 
 jobs:
+  lint-test:
+    name: format, lints and policy tests (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          components: clippy, rustfmt
+
+      # The build dependencies ci-rust-linux.yml installs for cua-driver.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
+
+      - name: Format and lint every build
+        working-directory: libs/cua-driver/rust
+        run: |
+          set -euo pipefail
+          cargo fmt --check
+          cargo clippy --locked -p cua-driver -p cua-driver-core --all-targets -- -D warnings
+          cargo clippy --locked -p cua-driver -p cua-driver-core --all-targets \
+            --features cua-driver/fixed-policy -- -D warnings
+          cargo clippy --locked -p cua-driver-core --all-targets \
+            --features fixed-policy-root-owned -- -D warnings
+          cargo clippy --locked -p cua-driver-core --no-default-features \
+            --features fixed-policy -- -D warnings
+
+      # The policy and authorization tests in the default build (the feature
+      # must leave its behavior unchanged) and in both feature builds; the
+      # updater's refusal in a fixed-policy build. The rest of the suites call
+      # tools with no policy configured, which a fixed-policy build never
+      # does; they run in the default build's own CI.
+      - name: Policy tests
+        working-directory: libs/cua-driver/rust
+        run: |
+          set -euo pipefail
+          cargo test --locked -p cua-driver-core --lib -- policy:: authorization::
+          cargo test --locked -p cua-driver-core --features fixed-policy --lib -- policy:: authorization::
+          cargo test --locked -p cua-driver-core --features fixed-policy-root-owned --lib -- policy::fixed::
+          cargo test --locked -p cua-driver --features fixed-policy --lib -- updater::
+
   build-test:
     name: build and test (darwin-universal)
     # macos-26: screencapturekit's Swift bridge needs the macOS 26 SDK
@@ -69,10 +133,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
-          components: clippy, rustfmt
+          components: clippy
 
       # The app version is the cua-driver package version; the release tag
-      # must name it.
+      # must name it and the variant.
       - name: Version and release tag
         id: version
         working-directory: libs/cua-driver/rust
@@ -84,36 +148,30 @@ jobs:
             | jq -r '.packages[] | select(.name == "cua-driver") | .version')
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { echo "unexpected cua-driver version: $VERSION" >&2; exit 2; }
-          TAG="${RELEASE_TAG_INPUT:-cua-driver-rs-v${VERSION}-fixedpolicy.1}"
-          BUILD="${TAG#"cua-driver-rs-v${VERSION}-fixedpolicy."}"
+          PREFIX="cua-driver-rs-v${VERSION}-${VARIANT}."
+          TAG="${RELEASE_TAG_INPUT:-${PREFIX}1}"
+          BUILD="${TAG#"$PREFIX"}"
           [[ "$BUILD" != "$TAG" && "$BUILD" =~ ^[0-9]+$ ]] \
-            || { echo "release_tag must be cua-driver-rs-v${VERSION}-fixedpolicy.<n>, got $TAG" >&2; exit 2; }
+            || { echo "release_tag must be ${PREFIX}<n>, got $TAG" >&2; exit 2; }
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Lint and unit-check both builds
+      # The macOS-only code; everything else is linted in the Linux job.
+      - name: Lint the macOS code
         working-directory: libs/cua-driver/rust
         run: |
-          cargo fmt --check
-          cargo clippy --locked -p cua-driver -p cua-driver-core --all-targets -- -D warnings
-          cargo clippy --locked -p cua-driver -p cua-driver-core --all-targets \
-            --features cua-driver/fixed-policy -- -D warnings
-          cargo clippy --locked -p cua-driver-core --no-default-features \
-            --features fixed-policy -- -D warnings
-          # The default build's policy and authorization tests: the feature
-          # must leave its behavior unchanged. (They set the policy
-          # environment variables, which a fixed-policy build ignores.)
-          cargo test --locked -p cua-driver-core --lib -- policy:: authorization::
+          cargo clippy --locked -p cua-driver -p platform-macos \
+            --features cua-driver/fixed-policy-root-owned -- -D warnings
 
-      - name: Build arm64 and x86_64 with the fixed-policy feature
+      - name: Build arm64 and x86_64 with the ${{ env.FEATURE }} feature
         working-directory: libs/cua-driver/rust
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: |
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
             cargo build --locked -p cua-driver -p cursor-theme-cli --release \
-              --features cua-driver/fixed-policy --target "$target"
+              --features "cua-driver/$FEATURE" --target "$target"
           done
 
       - name: Assemble and ad hoc sign CuaDriver.app
@@ -156,19 +214,43 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: End-to-end policy tests against the built app
+      # The tests set launchd's environment for the daemons LaunchServices
+      # starts themselves.
+      - name: End-to-end tests against the built app (${{ env.FEATURE }})
         working-directory: libs/cua-driver/scripts/tests
         env:
           CUA_FIXED_POLICY_E2E: "1"
-          CUA_FIXED_POLICY_E2E_LOGS: ${{ runner.temp }}/fixed-policy-e2e-logs
+          CUA_FIXED_POLICY_E2E_LOGS: ${{ runner.temp }}/fixed-policy-e2e-logs/${{ env.FEATURE }}
+          CUA_FIXED_POLICY_E2E_BUNDLE_ID: ${{ env.BUNDLE_ID }}
+          CUA_FIXED_POLICY_ROOT_OWNED: ${{ env.ROOT_OWNED }}
         run: |
           python -m pip install --disable-pip-version-check pytest==8.3.4
-          # Apps launched through LaunchServices take launchd's environment:
-          # no first-launch permission panel, no telemetry.
-          launchctl setenv CUA_DRIVER_RS_PERMISSIONS_GATE 0
-          launchctl setenv CUA_TELEMETRY 0
-          launchctl setenv DO_NOT_TRACK 1
           python -m pytest -v -p no:cacheprovider test_fixed_policy_macos.py
+
+      # The other variant, arm64 only: it reuses the dependencies built above.
+      # The app assembled above is not changed; only the installed copy is.
+      - name: Build the ${{ env.OTHER_FEATURE }} variant (arm64) and install it
+        working-directory: libs/cua-driver/rust
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: |
+          set -euo pipefail
+          cargo build --locked -p cua-driver --release \
+            --features "cua-driver/$OTHER_FEATURE" --target aarch64-apple-darwin
+          sudo cp target/aarch64-apple-darwin/release/cua-driver \
+            /Applications/CuaDriver.app/Contents/MacOS/cua-driver
+          sudo codesign --force --sign - /Applications/CuaDriver.app
+          codesign --verify --strict /Applications/CuaDriver.app
+          codesign -dv /Applications/CuaDriver.app 2>&1 | grep -Fx "Identifier=$BUNDLE_ID"
+
+      - name: End-to-end tests against the ${{ env.OTHER_FEATURE }} variant
+        working-directory: libs/cua-driver/scripts/tests
+        env:
+          CUA_FIXED_POLICY_E2E: "1"
+          CUA_FIXED_POLICY_E2E_LOGS: ${{ runner.temp }}/fixed-policy-e2e-logs/${{ env.OTHER_FEATURE }}
+          CUA_FIXED_POLICY_E2E_BUNDLE_ID: ${{ env.BUNDLE_ID }}
+          CUA_FIXED_POLICY_ROOT_OWNED: ${{ env.OTHER_ROOT_OWNED }}
+        run: python -m pytest -v -p no:cacheprovider test_fixed_policy_macos.py
 
       - name: Upload end-to-end driver logs
         if: failure()
@@ -201,7 +283,7 @@ jobs:
 
   release:
     name: publish release
-    needs: build-test
+    needs: [lint-test, build-test]
     if: github.event_name == 'workflow_dispatch' && inputs.release
     runs-on: ubuntu-latest
     permissions:
@@ -244,13 +326,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ "$ROOT_OWNED" == 1 ]]; then
+            OWNERSHIP="- Loads them only when \`~/.config/cua-driver\`, \`policy\` and both files are owned by root and
+            not writable by the account (\`~/.config\` may be the account's, not writable by group or others);
+            otherwise it serves the locked policy."
+          else
+            OWNERSHIP="- Loads them whoever owns them; build with \`root_owned: true\` to require root-owned files."
+          fi
           cat > notes.md <<EOF
           Cua Driver ${RELEASE_TAG#cua-driver-rs-v} for macOS (universal), built with the
-          \`fixed-policy\` feature from ${GITHUB_SHA}.
+          \`${FEATURE}\` feature from ${GITHUB_SHA}.
 
           - Ignores \`CUA_DRIVER_POLICY_FILE\` and \`CUA_DRIVER_MANAGED_POLICY_FILE\`; always loads
             \`~/.config/cua-driver/policy/policy.yaml\` and \`policy.rego\`, and serves a built-in
             locked policy when either is missing, a symbolic link or invalid.
+          ${OWNERSHIP}
+          - Never updates itself: \`cua-driver update\` refuses, and updates come from the operator.
           - Bundle id \`${BUNDLE_ID}\`, signed ad hoc (not notarized).
           - Verify with \`SHA256SUMS\`, the \`.sigstore.json\` bundles, or
             \`gh attestation verify <archive> --repo ${GITHUB_REPOSITORY}\`.
