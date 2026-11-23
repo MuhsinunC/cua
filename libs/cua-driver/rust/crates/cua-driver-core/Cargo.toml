@@ -19,7 +19,7 @@ keyring = ["dep:keyring"]
 # Operator-managed builds: ignore the policy environment variables and always
 # load ~/.config/cua-driver/policy/{policy.yaml,policy.rego}, serving a built-in
 # locked policy when either file is missing, a symbolic link or invalid.
-fixed-policy = ["yaml"]
+fixed-policy = ["yaml", "rego"]
 
 [dependencies]
 cua-driver-contract = { path = "../cua-driver-contract" }

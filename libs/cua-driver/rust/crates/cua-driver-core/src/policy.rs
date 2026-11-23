@@ -160,7 +160,8 @@ pub enum PolicySource {
     /// The layer's fixed file (builds with the `fixed-policy` feature).
     FixedFile,
     /// The built-in locked policy, served because the fixed file did not load.
-    BuiltInLocked { reason: String },
+    /// `file_present` says whether anything was found at the fixed path.
+    BuiltInLocked { reason: String, file_present: bool },
 }
 
 impl PolicySource {
@@ -174,9 +175,15 @@ impl PolicySource {
 
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Self::BuiltInLocked { reason } => Some(reason.as_str()),
+            Self::BuiltInLocked { reason, .. } => Some(reason.as_str()),
             _ => None,
         }
+    }
+
+    /// Whether the layer's own policy did not load and the built-in locked
+    /// policy is enforced in its place.
+    pub fn is_locked_fallback(&self) -> bool {
+        matches!(self, Self::BuiltInLocked { .. })
     }
 }
 
@@ -184,6 +191,8 @@ static CONFIGURED_POLICY: OnceLock<Result<Option<ConfiguredPolicyLayer>, String>
 static CONFIGURED_MANAGED_POLICY: OnceLock<Result<Option<ConfiguredPolicyLayer>, String>> =
     OnceLock::new();
 
+// A `fixed-policy` build reads its files through `fixed`, not by path.
+#[cfg_attr(feature = "fixed-policy", allow(dead_code))]
 fn policy_files(path: &Path) -> Result<Vec<PathBuf>> {
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);
@@ -212,35 +221,38 @@ fn policy_files(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+#[cfg_attr(feature = "fixed-policy", allow(dead_code))]
 fn policy_sha256(path: &Path) -> Result<String> {
-    let files = policy_files(path)?;
-    let mut digest = Sha256::new();
-    digest.update(b"cua-driver-policy-v1\0");
-    for file in files {
+    let mut contents = Vec::new();
+    for file in policy_files(path)? {
         let name = file
             .file_name()
             .and_then(|value| value.to_str())
-            .unwrap_or("policy");
+            .unwrap_or("policy")
+            .to_owned();
         let bytes = std::fs::read(&file)
             .with_context(|| format!("failed to hash policy {}", file.display()))?;
-        hash_policy_file(&mut digest, name, &bytes);
+        contents.push((name, bytes));
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(policy_digest(
+        contents
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    ))
 }
 
-fn hash_policy_file(digest: &mut Sha256, name: &str, bytes: &[u8]) {
-    digest.update((name.len() as u64).to_be_bytes());
-    digest.update(name.as_bytes());
-    digest.update((bytes.len() as u64).to_be_bytes());
-    digest.update(bytes);
-}
-
-#[cfg(not(feature = "fixed-policy"))]
-fn load_configured_layer(env_name: &str) -> Result<Option<ConfiguredPolicyLayer>, String> {
-    let Some(path_os) = std::env::var_os(env_name) else {
-        return Ok(None);
-    };
-    load_policy_path(Path::new(&path_os), PolicySource::Environment)
+/// The digest `status` reports for a policy: its files' names and contents,
+/// in order, under one versioned domain prefix.
+fn policy_digest<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cua-driver-policy-v1\0");
+    for (name, bytes) in files {
+        digest.update((name.len() as u64).to_be_bytes());
+        digest.update(name.as_bytes());
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    format!("{:x}", digest.finalize())
 }
 
 /// A `fixed-policy` build ignores the policy environment variables: each layer
@@ -250,10 +262,12 @@ fn load_configured_layer(env_name: &str) -> Result<Option<ConfiguredPolicyLayer>
     Ok(Some(fixed::load_layer(env_name)))
 }
 
-fn load_policy_path(
-    path: &Path,
-    source: PolicySource,
-) -> Result<Option<ConfiguredPolicyLayer>, String> {
+#[cfg(not(feature = "fixed-policy"))]
+fn load_configured_layer(env_name: &str) -> Result<Option<ConfiguredPolicyLayer>, String> {
+    let Some(path_os) = std::env::var_os(env_name) else {
+        return Ok(None);
+    };
+    let path = Path::new(&path_os);
     if !path.exists() {
         return Err(format!(
             "configured permission policy path does not exist: {}",
@@ -275,7 +289,7 @@ fn load_policy_path(
     Ok(Some(ConfiguredPolicyLayer {
         engine,
         sha256,
-        source,
+        source: PolicySource::Environment,
     }))
 }
 
@@ -334,10 +348,16 @@ pub fn managed_policy_source() -> Option<PolicySource> {
     layer_source(&CONFIGURED_MANAGED_POLICY, MANAGED_POLICY_FILE_ENV)
 }
 
-/// Whether a policy layer is configured for this process: always in a
-/// `fixed-policy` build, otherwise when its environment variable is set.
-pub fn layer_configured(env_name: &str) -> bool {
-    cfg!(feature = "fixed-policy") || std::env::var_os(env_name).is_some()
+/// Whether a policy layer is configured for this process: in a `fixed-policy`
+/// build, whether its fixed file is present; otherwise whether its environment
+/// variable is set. `source` is the layer's [`user_policy_source`] or
+/// [`managed_policy_source`].
+pub fn layer_configured(env_name: &str, source: Option<&PolicySource>) -> bool {
+    match source {
+        Some(PolicySource::FixedFile) => true,
+        Some(PolicySource::BuiltInLocked { file_present, .. }) => *file_present,
+        Some(PolicySource::Environment) | None => std::env::var_os(env_name).is_some(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -806,6 +826,20 @@ impl RegoPolicy {
                 .add_policy_from_file(path)
                 .with_context(|| format!("failed to load Rego policy {}", path.display()))?;
         }
+        Self::validated(engine)
+    }
+
+    /// Load one Rego module from its source text; `name` labels its errors.
+    #[cfg(feature = "fixed-policy")]
+    fn from_source(name: &str, source: String) -> Result<Self> {
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy(name.to_owned(), source)
+            .with_context(|| format!("failed to load Rego policy {name}"))?;
+        Self::validated(engine)
+    }
+
+    fn validated(mut engine: regorus::Engine) -> Result<Self> {
         engine.set_input_json(r#"{"server":"cua-driver","tool":"","arguments":{}}"#)?;
         match engine
             .eval_rule(REGO_ALLOW_RULE.to_owned())

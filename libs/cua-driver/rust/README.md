@@ -127,20 +127,33 @@ Regorus evaluates policies inside the daemon; no OPA service is required.
 
 ### Fixed policy builds
 
-An operator who must guarantee that no copy of the driver serves without their
-policy can build with `--features cua-driver/fixed-policy` (off by default).
-Such a build ignores `CUA_DRIVER_POLICY_FILE` and
+An operator who must guarantee that their copy of the driver never serves
+without their policy can build it with `--features cua-driver/fixed-policy`
+(off by default). Such a build ignores `CUA_DRIVER_POLICY_FILE` and
 `CUA_DRIVER_MANAGED_POLICY_FILE`, however the driver is started (`serve`,
 `mcp` and the daemon it launches, `open -a ... --args serve`), and always loads
 the user layer from `~/.config/cua-driver/policy/policy.yaml` and the managed
 layer from `policy.rego` in the same folder. `~` is the account's home
 directory from the user database, not `$HOME`.
 
-A layer whose file is missing, is a symbolic link, cannot be read or fails to
-load is replaced by a built-in locked policy that allows only `health_report`,
-`get_config`, `check_permissions`, `get_guide`, `list_sessions`, `get_session`
-and `get_session_state`. The driver still starts, so `status` can say why:
-it prints each layer's source (`fixed_file` or `built_in_locked`, with the
-reason), and the status JSON carries `user_policy_source`,
-`managed_policy_source` and their `*_locked_reason`. The fixed folder is
-supported on Unix; elsewhere both layers are always locked.
+The guarantee covers the `cua-driver` binary and `CuaDriver.app` built with
+the feature. `cua-driver-sdk` does not enable it, so a driver embedded through
+the SDK keeps the environment variables.
+
+Each file is opened one folder at a time from `~`: `.config`, `cua-driver`,
+`policy`, then the file, each relative to the folder before it and never
+through a symbolic link. The file must be a regular file, and the policy and
+its digest are built from the bytes read through that open. A layer whose file
+is missing, is or sits under a symbolic link below `~`, cannot be read or
+fails to load is replaced by a built-in locked policy that allows only
+`health_report`, `get_config`, `check_permissions`, `get_guide`,
+`list_sessions`, `get_session` and `get_session_state`.
+
+The driver still starts, so `status` can say why. For such a layer it reports
+`valid=false` (and `configured=false` when no file is there), the source
+`built_in_locked` and the reason; a layer loaded from its file reports the
+source `fixed_file`. The status JSON carries them as `*_policy_valid`,
+`*_policy_configured`, `*_policy_source` and `*_policy_locked_reason`. In
+default builds the source is `environment` for a layer loaded from its
+variable and `null` otherwise. The fixed folder is supported on Unix;
+elsewhere both layers are always locked.

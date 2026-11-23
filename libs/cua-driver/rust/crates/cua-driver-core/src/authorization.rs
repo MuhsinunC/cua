@@ -1399,6 +1399,8 @@ pub fn status_json_with_provider(authorization_host: Option<&'static str>) -> se
     let managed_policy = crate::policy::configured_managed_policy();
     let user_policy_sha256 = crate::policy::user_policy_sha256().ok().flatten();
     let managed_policy_sha256 = crate::policy::managed_policy_sha256().ok().flatten();
+    let user_policy_source = crate::policy::user_policy_source();
+    let managed_policy_source = crate::policy::managed_policy_source();
     let effective_active_risk_enforcement = mode
         .as_ref()
         .map(|mode| adapter_ids_with_state_for_mode(*mode, RiskEnforcement::Active))
@@ -1439,14 +1441,38 @@ pub fn status_json_with_provider(authorization_host: Option<&'static str>) -> se
             "built_in_default"
         },
         "unrestricted_disabled_by_admin": env_flag(DISABLE_UNRESTRICTED_ENV),
-        "user_policy_configured": crate::policy::layer_configured(crate::policy::POLICY_FILE_ENV),
+        "user_policy_configured": crate::policy::layer_configured(
+            crate::policy::POLICY_FILE_ENV,
+            user_policy_source.as_ref(),
+        ),
         "user_policy_active": matches!(policy, Ok(Some(_))),
-        "user_policy_valid": policy.is_ok(),
+        // A layer served by the built-in locked policy (`fixed-policy` builds)
+        // is active, but its own policy is not valid.
+        "user_policy_valid": policy.is_ok()
+            && !user_policy_source
+                .as_ref()
+                .is_some_and(crate::policy::PolicySource::is_locked_fallback),
         "user_policy_sha256": user_policy_sha256,
-        "managed_policy_configured": crate::policy::layer_configured(crate::policy::MANAGED_POLICY_FILE_ENV),
+        "user_policy_source": user_policy_source.as_ref().map(crate::policy::PolicySource::as_str),
+        "user_policy_locked_reason": user_policy_source
+            .as_ref()
+            .and_then(crate::policy::PolicySource::reason),
+        "managed_policy_configured": crate::policy::layer_configured(
+            crate::policy::MANAGED_POLICY_FILE_ENV,
+            managed_policy_source.as_ref(),
+        ),
         "managed_policy_active": matches!(managed_policy, Ok(Some(_))),
-        "managed_policy_valid": managed_policy.is_ok(),
+        "managed_policy_valid": managed_policy.is_ok()
+            && !managed_policy_source
+                .as_ref()
+                .is_some_and(crate::policy::PolicySource::is_locked_fallback),
         "managed_policy_sha256": managed_policy_sha256,
+        "managed_policy_source": managed_policy_source
+            .as_ref()
+            .map(crate::policy::PolicySource::as_str),
+        "managed_policy_locked_reason": managed_policy_source
+            .as_ref()
+            .and_then(crate::policy::PolicySource::reason),
         "built_in_ceiling": "reviewed_tool_and_risk_map_v1",
         "risk_metadata_version": RISK_METADATA_VERSION,
         "active_risk_enforcement": adapter_ids_with_state(RiskEnforcement::Active),
@@ -1468,25 +1494,6 @@ pub fn status_json_with_provider(authorization_host: Option<&'static str>) -> se
         "session_policy_valid": capability_manifest.is_ok(),
         "session_policy": capability_manifest_status,
     });
-    if cfg!(feature = "fixed-policy") {
-        if let Some(target) = status.as_object_mut() {
-            for (layer, source) in [
-                ("user", crate::policy::user_policy_source()),
-                ("managed", crate::policy::managed_policy_source()),
-            ] {
-                target.insert(
-                    format!("{layer}_policy_source"),
-                    serde_json::json!(source.as_ref().map(crate::policy::PolicySource::as_str)),
-                );
-                target.insert(
-                    format!("{layer}_policy_locked_reason"),
-                    serde_json::json!(source
-                        .as_ref()
-                        .and_then(crate::policy::PolicySource::reason)),
-                );
-            }
-        }
-    }
     let session_status = crate::session_authorization::status_json();
     if let (Some(target), Some(session_status)) =
         (status.as_object_mut(), session_status.as_object())
