@@ -17,17 +17,21 @@ on:
         type: boolean
         default: false
       bundle_id:
-        description: "CFBundleIdentifier of the built app"
+        description: "CFBundleIdentifier of the built app (default com.trycua.driver.fixedpolicy)"
         type: string
-        default: com.trycua.driver.fixedpolicy
+        default: ""
       release_tag:
-        description: "Release tag (cua-driver-rs-v<version>-fixedpolicy.<n>)"
+        description: "Release tag (default cua-driver-rs-v<cua-driver version>-fixedpolicy.1)"
         type: string
-        default: cua-driver-rs-v0.47.10-fixedpolicy.1
+        default: ""
   # A workflow_dispatch workflow must exist on the default branch before it can
-  # be dispatched; a push to the feature branch runs the build and tests too.
+  # be dispatched; until then, and on every other branch, a push that touches
+  # the driver or this workflow runs the build and tests.
   push:
-    branches: [feat/fixed-policy-locked-default]
+    branches-ignore: [main]
+    paths:
+      - "libs/cua-driver/**"
+      - ".github/workflows/build-fixed-policy-driver.yml"
 
 permissions:
   contents: read
@@ -41,7 +45,6 @@ env:
   CUA_TELEMETRY: "0"
   DO_NOT_TRACK: "1"
   BUNDLE_ID: ${{ inputs.bundle_id || 'com.trycua.driver.fixedpolicy' }}
-  RELEASE_TAG: ${{ inputs.release_tag || 'cua-driver-rs-v0.47.10-fixedpolicy.1' }}
 
 jobs:
   build-test:
@@ -50,14 +53,14 @@ jobs:
     # (see cd-rust-cua-driver.yml).
     runs-on: macos-26
     timeout-minutes: 180
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
     steps:
       - name: Validate inputs
         run: |
           [[ "$BUNDLE_ID" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]] || { echo "invalid bundle_id: $BUNDLE_ID" >&2; exit 2; }
           [[ "$BUNDLE_ID" != com.trycua.driver && "$BUNDLE_ID" != com.trycua.driver.local ]] \
             || { echo "bundle_id must differ from the release and local apps" >&2; exit 2; }
-          [[ "$RELEASE_TAG" =~ ^cua-driver-rs-v[0-9]+\.[0-9]+\.[0-9]+-fixedpolicy\.[0-9]+$ ]] \
-            || { echo "invalid release_tag: $RELEASE_TAG" >&2; exit 2; }
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -68,6 +71,27 @@ jobs:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
           components: clippy, rustfmt
 
+      # The app version is the cua-driver package version; the release tag
+      # must name it.
+      - name: Version and release tag
+        id: version
+        working-directory: libs/cua-driver/rust
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "cua-driver") | .version')
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "unexpected cua-driver version: $VERSION" >&2; exit 2; }
+          TAG="${RELEASE_TAG_INPUT:-cua-driver-rs-v${VERSION}-fixedpolicy.1}"
+          BUILD="${TAG#"cua-driver-rs-v${VERSION}-fixedpolicy."}"
+          [[ "$BUILD" != "$TAG" && "$BUILD" =~ ^[0-9]+$ ]] \
+            || { echo "release_tag must be cua-driver-rs-v${VERSION}-fixedpolicy.<n>, got $TAG" >&2; exit 2; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Lint and unit-check both builds
         working-directory: libs/cua-driver/rust
         run: |
@@ -75,6 +99,8 @@ jobs:
           cargo clippy --locked -p cua-driver -p cua-driver-core --all-targets -- -D warnings
           cargo clippy --locked -p cua-driver -p cua-driver-core --all-targets \
             --features cua-driver/fixed-policy -- -D warnings
+          cargo clippy --locked -p cua-driver-core --no-default-features \
+            --features fixed-policy -- -D warnings
           # The default build's policy and authorization tests: the feature
           # must leave its behavior unchanged. (They set the policy
           # environment variables, which a fixed-policy build ignores.)
@@ -94,7 +120,6 @@ jobs:
         working-directory: libs/cua-driver/rust
         run: |
           set -euo pipefail
-          VERSION="${RELEASE_TAG#cua-driver-rs-v}"
           mkdir -p release/universal
           for bin in cua-driver cua-cursor-theme; do
             lipo -create "target/aarch64-apple-darwin/release/$bin" \
@@ -108,9 +133,9 @@ jobs:
           cp release/universal/cua-driver release/universal/cua-cursor-theme "$APP/Contents/MacOS/"
           chmod +x "$APP/Contents/MacOS/cua-driver" "$APP/Contents/MacOS/cua-cursor-theme"
           plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$APP/Contents/Info.plist"
-          BUNDLE_VERSION="${VERSION%%-*}"
-          plutil -replace CFBundleShortVersionString -string "$BUNDLE_VERSION" "$APP/Contents/Info.plist"
-          plutil -replace CFBundleVersion -string "$BUNDLE_VERSION" "$APP/Contents/Info.plist"
+          plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
+          plutil -replace CFBundleVersion -string "$VERSION" "$APP/Contents/Info.plist"
+          "$APP/Contents/MacOS/cua-driver" --version | grep -Fx "cua-driver $VERSION"
           # Ad hoc signatures, nested code first; no entitlements (the
           # release entitlements name a Developer ID team).
           codesign --force --sign - "$APP/Contents/MacOS/cua-cursor-theme"
@@ -157,8 +182,7 @@ jobs:
         working-directory: libs/cua-driver/rust
         run: |
           set -euo pipefail
-          VERSION="${RELEASE_TAG#cua-driver-rs-v}"
-          STAGE="cua-driver-rs-${VERSION}-darwin-universal"
+          STAGE="cua-driver-rs-${RELEASE_TAG#cua-driver-rs-v}-darwin-universal"
           mkdir -p "release/$STAGE" dist
           cp release/universal/cua-driver release/universal/cua-cursor-theme "release/$STAGE/"
           cp -R release/CuaDriver.app "release/$STAGE/CuaDriver.app"
@@ -184,6 +208,8 @@ jobs:
       contents: write # create the release and its tag
       id-token: write # keyless Sigstore signing
       attestations: write # build-provenance attestation
+    env:
+      RELEASE_TAG: ${{ needs.build-test.outputs.release_tag }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
