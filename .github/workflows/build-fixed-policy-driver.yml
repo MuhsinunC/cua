@@ -1,0 +1,237 @@
+name: "Build: Cua Driver (fixed policy)"
+
+# Builds the universal CuaDriver.app with the `fixed-policy` feature, the way
+# cd-rust-cua-driver.yml builds the release app, without Developer ID signing
+# or notarization: the app is signed ad hoc and carries its own bundle id, so
+# macOS privacy grants never confuse it with the release app. The end-to-end
+# tests in libs/cua-driver/scripts/tests/test_fixed_policy_macos.py run
+# against the built app on the runner. The `release` job publishes the tested
+# archive (SHA256SUMS, Sigstore bundles and a build-provenance attestation)
+# only when dispatched with `release: true`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish the tested build as a release of this repository"
+        type: boolean
+        default: false
+      bundle_id:
+        description: "CFBundleIdentifier of the built app"
+        type: string
+        default: com.trycua.driver.fixedpolicy
+      release_tag:
+        description: "Release tag (cua-driver-rs-v<version>-fixedpolicy.<n>)"
+        type: string
+        default: cua-driver-rs-v0.47.10-fixedpolicy.1
+  # A workflow_dispatch workflow must exist on the default branch before it can
+  # be dispatched; a push to the feature branch runs the build and tests too.
+  push:
+    branches: [feat/fixed-policy-locked-default]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-fixed-policy-driver-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Cua programs run here never send usage telemetry.
+  CUA_TELEMETRY: "0"
+  DO_NOT_TRACK: "1"
+  BUNDLE_ID: ${{ inputs.bundle_id || 'com.trycua.driver.fixedpolicy' }}
+  RELEASE_TAG: ${{ inputs.release_tag || 'cua-driver-rs-v0.47.10-fixedpolicy.1' }}
+
+jobs:
+  build-test:
+    name: build and test (darwin-universal)
+    # macos-26: screencapturekit's Swift bridge needs the macOS 26 SDK
+    # (see cd-rust-cua-driver.yml).
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$BUNDLE_ID" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]] || { echo "invalid bundle_id: $BUNDLE_ID" >&2; exit 2; }
+          [[ "$BUNDLE_ID" != com.trycua.driver && "$BUNDLE_ID" != com.trycua.driver.local ]] \
+            || { echo "bundle_id must differ from the release and local apps" >&2; exit 2; }
+          [[ "$RELEASE_TAG" =~ ^cua-driver-rs-v[0-9]+\.[0-9]+\.[0-9]+-fixedpolicy\.[0-9]+$ ]] \
+            || { echo "invalid release_tag: $RELEASE_TAG" >&2; exit 2; }
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+          components: clippy, rustfmt
+
+      - name: Lint and unit-check both builds
+        working-directory: libs/cua-driver/rust
+        run: |
+          cargo fmt --check
+          cargo clippy --locked -p cua-driver -p cua-driver-core --all-targets -- -D warnings
+          cargo clippy --locked -p cua-driver -p cua-driver-core --all-targets \
+            --features cua-driver/fixed-policy -- -D warnings
+          # The default build's policy and authorization tests: the feature
+          # must leave its behavior unchanged. (They set the policy
+          # environment variables, which a fixed-policy build ignores.)
+          cargo test --locked -p cua-driver-core --lib -- policy:: authorization::
+
+      - name: Build arm64 and x86_64 with the fixed-policy feature
+        working-directory: libs/cua-driver/rust
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --locked -p cua-driver -p cursor-theme-cli --release \
+              --features cua-driver/fixed-policy --target "$target"
+          done
+
+      - name: Assemble and ad hoc sign CuaDriver.app
+        working-directory: libs/cua-driver/rust
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#cua-driver-rs-v}"
+          mkdir -p release/universal
+          for bin in cua-driver cua-cursor-theme; do
+            lipo -create "target/aarch64-apple-darwin/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin" -output "release/universal/$bin"
+            lipo -info "release/universal/$bin"
+          done
+          APP=release/CuaDriver.app
+          mkdir -p "$APP"
+          cp -R scripts/CuaDriverBundle/Contents "$APP/Contents"
+          rm -f "$APP/Contents/MacOS/.gitkeep"
+          cp release/universal/cua-driver release/universal/cua-cursor-theme "$APP/Contents/MacOS/"
+          chmod +x "$APP/Contents/MacOS/cua-driver" "$APP/Contents/MacOS/cua-cursor-theme"
+          plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$APP/Contents/Info.plist"
+          BUNDLE_VERSION="${VERSION%%-*}"
+          plutil -replace CFBundleShortVersionString -string "$BUNDLE_VERSION" "$APP/Contents/Info.plist"
+          plutil -replace CFBundleVersion -string "$BUNDLE_VERSION" "$APP/Contents/Info.plist"
+          # Ad hoc signatures, nested code first; no entitlements (the
+          # release entitlements name a Developer ID team).
+          codesign --force --sign - "$APP/Contents/MacOS/cua-cursor-theme"
+          codesign --force --sign - "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+          codesign -dv "$APP" 2>&1 | tee release/codesign.txt
+          grep -Fx "Identifier=$BUNDLE_ID" release/codesign.txt
+          grep -Fx "Signature=adhoc" release/codesign.txt
+
+      - name: Install the app where `cua-driver mcp` launches it from
+        working-directory: libs/cua-driver/rust
+        run: |
+          test ! -e /Applications/CuaDriver.app || { echo "/Applications/CuaDriver.app already exists" >&2; exit 1; }
+          sudo ditto release/CuaDriver.app /Applications/CuaDriver.app
+          codesign --verify --strict /Applications/CuaDriver.app
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: End-to-end policy tests against the built app
+        working-directory: libs/cua-driver/scripts/tests
+        env:
+          CUA_FIXED_POLICY_E2E: "1"
+          CUA_FIXED_POLICY_E2E_LOGS: ${{ runner.temp }}/fixed-policy-e2e-logs
+        run: |
+          python -m pip install --disable-pip-version-check pytest==8.3.4
+          # Apps launched through LaunchServices take launchd's environment:
+          # no first-launch permission panel, no telemetry.
+          launchctl setenv CUA_DRIVER_RS_PERMISSIONS_GATE 0
+          launchctl setenv CUA_TELEMETRY 0
+          launchctl setenv DO_NOT_TRACK 1
+          python -m pytest -v -p no:cacheprovider test_fixed_policy_macos.py
+
+      - name: Upload end-to-end driver logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fixed-policy-e2e-logs
+          path: ${{ runner.temp }}/fixed-policy-e2e-logs
+          if-no-files-found: warn
+
+      - name: Package
+        working-directory: libs/cua-driver/rust
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#cua-driver-rs-v}"
+          STAGE="cua-driver-rs-${VERSION}-darwin-universal"
+          mkdir -p "release/$STAGE" dist
+          cp release/universal/cua-driver release/universal/cua-cursor-theme "release/$STAGE/"
+          cp -R release/CuaDriver.app "release/$STAGE/CuaDriver.app"
+          cp ../../../LICENSE.md "release/$STAGE/LICENSE"
+          cp THIRD_PARTY_NOTICES.md "release/$STAGE/THIRD_PARTY_NOTICES.md"
+          COPYFILE_DISABLE=1 tar -czf "dist/$STAGE.tar.gz" -C release "$STAGE"
+          (cd dist && shasum -a 256 -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cua-driver-fixed-policy-darwin-universal
+          path: |
+            libs/cua-driver/rust/dist/*.tar.gz
+            libs/cua-driver/rust/dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build-test
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and its tag
+      id-token: write # keyless Sigstore signing
+      attestations: write # build-provenance attestation
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cua-driver-fixed-policy-darwin-universal
+          path: dist
+
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      # Same keyless bundles as the upstream release: <asset>.sigstore.json,
+      # issued to this workflow at this ref.
+      - name: Sigstore bundles
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          for f in ./*.tar.gz SHA256SUMS; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f" >/dev/null
+          done
+          ls -l
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Cua Driver ${RELEASE_TAG#cua-driver-rs-v} for macOS (universal), built with the
+          \`fixed-policy\` feature from ${GITHUB_SHA}.
+
+          - Ignores \`CUA_DRIVER_POLICY_FILE\` and \`CUA_DRIVER_MANAGED_POLICY_FILE\`; always loads
+            \`~/.config/cua-driver/policy/policy.yaml\` and \`policy.rego\`, and serves a built-in
+            locked policy when either is missing, a symbolic link or invalid.
+          - Bundle id \`${BUNDLE_ID}\`, signed ad hoc (not notarized).
+          - Verify with \`SHA256SUMS\`, the \`.sigstore.json\` bundles, or
+            \`gh attestation verify <archive> --repo ${GITHUB_REPOSITORY}\`.
+          EOF
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes-file notes.md \
+            --prerelease
